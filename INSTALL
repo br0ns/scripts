@@ -1,0 +1,20 @@
+#!/bin/sh
+
+DST=~/bin
+
+if [ $# -gt 1 ] ; then
+    echo "usage: $0 [<dst, default: $DST)>]"
+    exit 1
+fi
+
+if [ $# -eq 1 ] ; then
+    DST=$1
+fi
+
+for f in * ; do
+    if [ "$f" = "$(basename "$0")" -o ! -x "$f" ] ; then
+        continue
+    fi
+    echo "$f"
+    ln -fs "$(realpath "$f")" "$DST/$f"
+done

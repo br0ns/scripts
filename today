@@ -1,0 +1,194 @@
+#!/usr/bin/env python2
+
+EDITOR  ='emacs'
+TODAY   ='~/TODAY.md'
+ARCHIVE ='~/.today'
+
+TEMPLATE_TODAY=\
+'''# Things I should do today (%(date)s)
+'''
+TEMPLATE_YESTERDAY=\
+'''# Things I should have done yesterday
+'''
+
+import os
+import sys
+import time
+import re
+import subprocess
+
+TODAY = os.path.expanduser(TODAY)
+ARCHIVE = os.path.expanduser(ARCHIVE)
+
+def info(msg, fd=sys.stderr):
+    print >>fd, msg
+
+def err(msg, fd=sys.stderr):
+    print >>fd, 'EE', msg
+
+    # Create archive dir
+if not os.path.exists(ARCHIVE):
+    info('Creating archive directory: %s' % ARCHIVE)
+    os.mkdir(ARCHIVE)
+
+# Decide whether a recurring tasks recurs today
+def recur_today(when):
+    months = ('jan', 'feb', 'mar', 'apr', 'may', 'jun',
+              'jul', 'aug', 'sep', 'okt', 'nov', 'dec',)
+    days = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun',)
+    aliases = {'weekday' : 'mon,tue,wed,thu,fri',
+               'everyday': 'mon,tue,wed,thu,fri,sat,sun',
+               'weekend' : 'sat,sun',
+               }
+    when = aliases.get(when, when)
+    now = time.localtime()
+    for w in when.split(','):
+        if '-' in w:
+            m, d = w.split('-', 1)
+            d = int(d)
+            m = months.index(m) + 1
+            if now.tm_mon == m and now.tm_mday == d:
+                return True
+        else:
+            d = days.index(w)
+            if now.tm_wday == d:
+                return True
+    return False
+
+def go():
+    # Path to yesterday's TODO list
+    prefix, ext = os.path.splitext(os.path.basename(TODAY))
+    YESTERDAY = os.path.join(
+        ARCHIVE, '%s.%s%s' %
+        (prefix,
+         time.strftime('%y-%m-%d', time.localtime(time.time() - 86400)),
+         ext))
+
+    # Day changed; move list to archive
+    if not os.path.exists(YESTERDAY) and os.path.exists(TODAY):
+        info('Moving %s to %s' % (TODAY, YESTERDAY))
+        os.rename(TODAY, YESTERDAY)
+
+    # Create today's TODO list
+    if not os.path.exists(TODAY):
+        # Touch yesterday's list; if it does not exist we need to create it so
+        # todays list will not be archived immediately
+        with open(YESTERDAY, 'a'):
+            pass
+
+        # Today's list
+        today = TEMPLATE_TODAY % {
+            'date': time.strftime('%y-%m-%d', time.localtime())
+        }
+
+        # Create task lists
+
+        def show_tasks(tasks):
+            return '\n'.join('- [ ] %s' % task for task in tasks) + '\n'
+
+        # Add recurring tasks
+        today_tasks = []
+        recur_path = os.path.join(ARCHIVE, 'recurring')
+        if os.path.exists(recur_path):
+            with open(recur_path) as fd:
+                for line in fd:
+                    line = line.strip()
+                    if not line or line[0] == '#':
+                        continue
+                    try:
+                        when, task = line.split(' ', 1)
+                        recur = recur_today(when)
+                    except:
+                        recur = False
+                    if recur:
+                        today_tasks.append(time.strftime(task))
+        if today_tasks:
+            today += show_tasks(today_tasks)
+        else:
+            today += '- [ ]\n'
+
+        # Import unfinished tasks from yesterday's list
+        yesterday_tasks = []
+        for t in re.findall(r'- \[ ?] (.*)', file(YESTERDAY, 'r').read()):
+            if t not in today_tasks:
+                yesterday_tasks.append(t)
+        if yesterday_tasks:
+            today += '\n'
+            today += TEMPLATE_YESTERDAY
+            today += show_tasks(yesterday_tasks)
+
+        with open(TODAY, 'w') as fd:
+            fd.write(today)
+
+def edit():
+    # Open in editor and possibly reload when editor is closed
+    argv = [EDITOR, TODAY]
+    while True:
+        go()
+        subprocess.call(argv)
+        try:
+            # TODO: Don't depend on python-zenity; re-implement here
+            from pythonzenity import Question
+            reload = Question(text='Reload todo list?')
+        except:
+            break
+        if not reload:
+            break
+
+def ls():
+    prefix, ext = os.path.splitext(os.path.basename(TODAY))
+    prev_skipped = []
+    for name in sorted(os.listdir(ARCHIVE)):
+        p, e = os.path.splitext(name)
+        if not p.startswith(prefix) or e != ext:
+            continue
+
+        date = p.split('.', 1)[1]
+        success = []
+        failure = []
+        skipped = []
+        data = open(os.path.join(ARCHIVE, name)).read()
+        for line in data.splitlines(False):
+            for mark, lst in zip(
+                    'x+- ',
+                    (success, success, failure, skipped)):
+                if line.startswith('- [%s] ' % mark):
+                    lst.append(line[6:])
+
+        if success or failure or skipped:
+            print '# %s' % date
+
+        if all(t in skipped for t in prev_skipped):
+            skipped_again = len(prev_skipped)
+            skipped_show = [t for t in skipped if t not in prev_skipped]
+        else:
+            skipped_again = 0
+            skipped_show = skipped
+
+        for mark, lst in zip('+- ', (success, failure, skipped_show)):
+            for task in lst:
+                print '- [%s] %s' % (mark, task)
+
+        if skipped_again:
+            print '(%d %s skipped again)' % (
+                skipped_again,
+                'tasks' if skipped_again else 'task',
+                )
+
+        prev_skipped = skipped
+
+def usage():
+    print >>sys.stderr, \
+        'usage: %s [ls]' % sys.argv[0]
+
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        edit()
+    elif len(sys.argv) == 2:
+        cmd = sys.argv[1]
+        if cmd == 'ls':
+            ls()
+        else:
+            usage()
+    else:
+        usage()

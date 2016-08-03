@@ -1,0 +1,11 @@
+#!/bin/sh
+
+if [ $# -lt 1 ] ; then
+    echo "usage: $0 <doc.md> [<doc.md> [...]]"
+    exit 1
+fi
+
+for doc in "$@" ; do
+    echo "$doc"
+    pandoc "$doc" -o "${doc%.md}.pdf"
+done

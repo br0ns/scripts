@@ -1,0 +1,52 @@
+#!/usr/bin/env python2
+import os, sys, subprocess, re
+
+DEFAULT_STEP = 5
+
+def usage():
+    print 'usage: %s (+N|-N|toggle|mute|unmute)' % sys.argv[0]
+    sys.exit(1)
+
+if len(sys.argv) != 2:
+    usage()
+
+opt = sys.argv[1]
+if opt[0] in '+-':
+    if len(opt[0]) == 1:
+        adjust = DEFAULT_STEP
+    elif opt[1:].isdigit():
+        adjust = int(opt[1:])
+    else:
+        usage()
+    sign = opt[0]
+    opt = 'adjust'
+elif opt.isdigit():
+    adjust = int(opt)
+    sign = ''
+    opt = 'adjust'
+
+if not opt in ('adjust', 'toggle', 'mute', 'unmute'):
+    usage()
+
+if   opt == 'adjust':
+    cmd = '%d%%%s unmute' % (adjust, sign)
+else:
+    cmd = opt
+
+cmd = 'amixer sset Master %s' % cmd
+out = subprocess.check_output(cmd, shell = True)
+
+if not out.startswith('Simple mixer control'):
+    print 'Unexpected output from running `%s`:' % cmd
+    print '=' * 80
+    print out
+    print '=' * 80
+    sys.exit(1)
+
+lvl, state = re.findall(r'\[(\d+)%\] \[[^\]]+\] \[(on|off)\]', out)[0]
+lvl = int(lvl)
+
+if state == 'off':
+    os.system('notify "Volume (muted)" --percentage 0 --time 1')
+else:
+    os.system('notify "Volume (%d%%)" --percentage %d --time 1' % (lvl, lvl))

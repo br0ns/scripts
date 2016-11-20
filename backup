@@ -18,7 +18,7 @@ function bup () {
 }
 
 # Mount?
-if [ $1 = "mount" ] ; then
+if [ $# = 1 ] && [ $1 = "mount" ] ; then
     if mount | grep -q "$MNT" ; then
         echo "$MNT is already mounted"
         exit

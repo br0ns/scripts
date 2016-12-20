@@ -47,8 +47,9 @@ function parse_git_branch {
 }
 
 function status() {
-    cd "$(dirname "$@")"
+    pushd "$(dirname "$@")" > /dev/null
     pwd
+    git status | grep ahead
     (git status | grep "nothing to commit") &>/dev/null
     if [ "$?" -eq 0 ] ; then
         echo -en "\x01\x1b[32m\x02"
@@ -57,6 +58,7 @@ function status() {
     fi
     parse_git_branch
     echo -en "\x01\x1b[m\x02"
+    popd > /dev/null
 }
 
 for dir in "$@" ; do

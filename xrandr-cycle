@@ -99,11 +99,9 @@ def switch():
     print 'Running:', ' '.join(args)
     subprocess.call(args)
 
-    # Hack: Resize wallpaper and fix the keyboard
+    # Hack: Resize wallpaper
     subprocess.call('''
 feh --bg-fill ~/.wallpaper.jpg
-setxkbmap us -variant altgr-intl -option compose:prsc,compose:menu,nodeadkeys
-xmodmap ~/.xmodmap
     ''', shell=True)
 
 

@@ -13,11 +13,13 @@ def switch():
       if m:
         curcard = m.group(1)
 
-    cards = []
+    cards = set()
     for line in subprocess.check_output(['aplay', '-l']).splitlines():
       m = re.match(r'card \d+: (\w+)', line)
       if m:
-        cards.append(m.group(1))
+        cards.add(m.group(1))
+
+    cards = sorted(cards)
 
     if curcard in cards:
       curidx = cards.index(curcard)

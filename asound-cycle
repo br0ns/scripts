@@ -26,7 +26,9 @@ def switch():
 
     curidx = (curidx + 1) % len(cards)
 
-    conf = 'pcm.!default sysdefault:%s' % cards[curidx]
+    card = cards[curidx]
+    print 'Using card "%s"' % card
+    conf = 'pcm.!default sysdefault:%s' % card
 
     file(dotasoundrc, 'w').write(conf)
 

@@ -35,6 +35,8 @@ else:
 
 cmd = 'amixer sset Master %s' % cmd
 out = subprocess.check_output(cmd, shell = True)
+print >>sys.stderr, '$ %s' % cmd
+print >>sys.stderr, out
 
 if not out.startswith('Simple mixer control'):
     print 'Unexpected output from running `%s`:' % cmd
@@ -43,7 +45,7 @@ if not out.startswith('Simple mixer control'):
     print '=' * 80
     sys.exit(1)
 
-lvl, state = re.findall(r'\[(\d+)%\] \[[^\]]+\] \[(on|off)\]', out)[0]
+lvl, state = re.findall(r'\[(\d+)%\].*?\[(on|off)\]', out)[0]
 lvl = int(lvl)
 
 if state == 'off':

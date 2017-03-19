@@ -1,54 +1,174 @@
 #!/usr/bin/env python2
-import os, sys, subprocess, re
+import os
+import sys
+import subprocess
+import re
+
+from collections import defaultdict
 
 DEFAULT_STEP = 5
+VERBOSE = False
 
 def usage():
-    print 'usage: %s (+N|-N|toggle|mute|unmute)' % sys.argv[0]
+    print >>sys.stderr, '''usage: %s ([+-]<0-100>|mute|unmute|toggle|next) [-v|--verbose]
+
+    N:       Set volume to N%%
+    +N:      Increase volume by N%%
+    -N:      Decrease volume by N%%
+    mute:    Mute volume
+    unmute:  Unmute volume
+    toggle:  Toggle between muted/unmuted
+    next:    Switch all outputs next Pulse Audio sink, and set it as the default
+             sink ''' % sys.argv[0]
     sys.exit(1)
 
-if len(sys.argv) != 2:
+def optparse(argv):
+  global VERBOSE
+  try:
+    argv.remove('-v')
+    VERBOSE = True
+  except:
+    pass
+  try:
+    argv.remove('--verbose')
+    VERBOSE = True
+  except:
+    pass
+
+  if len(argv) != 2:
+    usage()
+  opt = argv[1]
+  arg = None
+  if opt[0] in '+-':
+      if len(opt) == 1:
+          arg = int(opt + str(DEFAULT_STEP))
+      elif opt[1:].isdigit():
+          arg = int(opt)
+      else:
+          usage()
+      opt = 'adjust'
+  elif opt.isdigit():
+      arg = int(opt)
+      opt = 'set'
+
+  elif opt not in ('toggle', 'mute', 'unmute', 'next'):
     usage()
 
-opt = sys.argv[1]
-if opt[0] in '+-':
-    if len(opt[0]) == 1:
-        adjust = DEFAULT_STEP
-    elif opt[1:].isdigit():
-        adjust = int(opt[1:])
-    else:
-        usage()
-    sign = opt[0]
-    opt = 'adjust'
-elif opt.isdigit():
-    adjust = int(opt)
-    sign = ''
-    opt = 'adjust'
+  if arg:
+    arg = arg * 0x10000 / 100
 
-if not opt in ('adjust', 'toggle', 'mute', 'unmute'):
-    usage()
+  return opt, arg
 
-if   opt == 'adjust':
-    cmd = '%d%%%s unmute' % (adjust, sign)
+def runcmd(cmd):
+  out = subprocess.check_output(cmd, shell = True)
+  if VERBOSE:
+    print >>sys.stderr, '$ %s' % cmd
+    print >>sys.stderr, out
+  return out
+
+def pacmd(cmd):
+  return runcmd('pacmd ' + cmd)
+
+def state():
+  current_sink = None
+  sinks = []
+  volume = {}
+  muted = {}
+  for line in pacmd('dump').strip().splitlines():
+    sink = None
+    m = re.match(r'set-sink-volume (\S+) (0x[0-9a-f]+)', line)
+    if m:
+      sink, v = m.groups()
+      v = int(v, 16)
+      volume[sink] = v
+    m = re.match(r'set-sink-mute (\S+) (yes|no)', line)
+    if m:
+      sink, m = m.groups()
+      m = m == 'yes'
+      muted[sink] = m
+    m = re.match(r'set-default-sink (\S+)', line)
+    if m:
+      sink, = m.groups()
+      current_sink = sink
+
+    if sink and sink not in sinks:
+      sinks.append(sink)
+
+  return current_sink, sinks, volume, muted
+
+opt, arg = optparse(sys.argv)
+current, sinks, volume, muted = state()
+
+def mute(sink, mute):
+  muted[sink] = mute
+  pacmd('set-sink-mute %s %s' % (current, 'yes' if mute else 'no'))
+
+def card_name(sink):
+  this = False
+  for line in pacmd('list-sinks').strip().splitlines():
+    m = re.match(r'\s*name:\s*<(\S+)>', line)
+    if m:
+      if m.group(1) == sink:
+        this = True
+    m = re.match(r'\s*alsa\.card_name\s*=\s*"(.*)"', line)
+    if m:
+      if this:
+        return m.group(1)
+
+def move_inputs(sink):
+  idx = None
+  for line in pacmd('list-sinks').strip().splitlines():
+    m = re.match(r'\s*index:\s*([0-9]+)', line)
+    if m:
+      idx = int(m.group(1))
+    m = re.match(r'\s*name:\s*<(\S+)>', line)
+    if m:
+      if m.group(1) == sink:
+        break
+
+  if idx is None:
+    print >>sys.stderr, 'could not find sink index for "%s"' % sink
+    exit(-1)
+
+  sink = idx
+
+  for line in pacmd('list-sink-inputs').strip().splitlines():
+    m = re.match(r'\s*index:\s*([0-9]+)', line)
+    if m:
+      idx = int(m.group(1))
+      pacmd('move-sink-input %d %d' % (idx, sink))
+
+if opt == 'adjust':
+  arg = volume.get(current, 0) + arg
+  arg = min(0x10000, arg)
+  arg = max(0, arg)
+  volume[current] = arg
+  opt = 'set'
+
+if   opt == 'set':
+  volume[current] = arg
+  pacmd('set-sink-volume %s %s' % (current, arg))
+  mute(current, False)
+
+elif opt == 'mute':
+  mute(current, True)
+
+elif opt == 'unmute':
+  mute(current, False)
+
+elif opt == 'toggle':
+  mute(current, not muted.get(current))
+
+elif opt == 'next':
+  current = sinks[(sinks.index(current) + 1) % len(sinks)]
+  move_inputs(current)
+  pacmd('set-default-sink %s' % current)
+
+print card_name(current) or current
+if muted[current]:
+  print 'muted'
+  os.system('notify "Volume (muted)" --percentage 0 --time 1 &')
 else:
-    cmd = opt
-
-cmd = 'amixer sset Master %s' % cmd
-out = subprocess.check_output(cmd, shell = True)
-print >>sys.stderr, '$ %s' % cmd
-print >>sys.stderr, out
-
-if not out.startswith('Simple mixer control'):
-    print 'Unexpected output from running `%s`:' % cmd
-    print '=' * 80
-    print out
-    print '=' * 80
-    sys.exit(1)
-
-lvl, state = re.findall(r'\[(\d+)%\].*?\[(on|off)\]', out)[0]
-lvl = int(lvl)
-
-if state == 'off':
-    os.system('notify "Volume (muted)" --percentage 0 --time 1')
-else:
-    os.system('notify "Volume (%d%%)" --percentage %d --time 1' % (lvl, lvl))
+  v = round(volume[current] * 100.0 / 0x10000)
+  os.system('notify "Volume (%d%%)" --percentage %d --time 1 &' % (v, v))
+  print '%d%%' % v

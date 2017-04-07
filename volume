@@ -60,7 +60,7 @@ def optparse(argv):
   return opt, arg
 
 def runcmd(cmd):
-  out = subprocess.check_output(cmd, shell = True)
+  out = subprocess.check_output(cmd, shell=True)
   if VERBOSE:
     print >>sys.stderr, '$ %s' % cmd
     print >>sys.stderr, out
@@ -68,6 +68,16 @@ def runcmd(cmd):
 
 def pacmd(cmd):
   return runcmd('pacmd ' + cmd)
+
+def assert_pulseaudio_running():
+  for _ in range(5):
+    try:
+      runcmd('pulseaudio --check')
+      return
+    except:
+      runcmd('pulseaudio --start')
+  print >>sys.stderr, 'Could not start PulseAudio'
+  sys.exit(1)
 
 def state():
   current_sink = None
@@ -97,6 +107,8 @@ def state():
   return current_sink, sinks, volume, muted
 
 opt, arg = optparse(sys.argv)
+
+assert_pulseaudio_running()
 current, sinks, volume, muted = state()
 
 def mute(sink, mute):

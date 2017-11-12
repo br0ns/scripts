@@ -2,10 +2,10 @@
 
 DEV=/dev/sda
 MNT=/media/backup
-TARGET=/home/br0ns/
 BUP_DIR="$MNT/bup/"
 HOST="$(hostname)"
-EXCLUDE_PATHS=$HOME/.backup-exclude-paths
+PATHS=$HOME/.backup-paths
+EXCLUDE=$HOME/.backup-exclude
 
 # Bake BUP_DIR into `bup` command
 BUP_BIN="$(which bup)"
@@ -41,15 +41,22 @@ fi
 # Extra commands
 case $1 in
     now)
-        if [ -f $EXCLUDE_PATHS ] ; then
-            EXCL="--exclude-from=$EXCLUDE_PATHS"
+        if [ -f $EXCLUDE ] ; then
+            EXCL="--exclude-rx-from=$EXCLUDE"
         else
             EXCL=""
         fi
 
-        bup index --print --modified --status --update --one-file-system \
-            "$EXCL" "$TARGET"
-        bup save --name="$HOST" "$TARGET"
+        while read line ; do
+            # Strip comments
+            line="${line%%#*}"
+            # Empty lines
+            [ -z "$line" ] && continue
+            echo -e "\033[32;1m+\033[m" "$line"
+            bup index --print --modified --status --update --one-file-system \
+                "$EXCL" "$line"
+        done < "$PATHS"
+        bup save --name="$HOST" "/"
         ;;
 
     umount)

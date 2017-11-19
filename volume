@@ -130,7 +130,7 @@ def card_name(sink):
 def move_inputs(sink):
   idx = None
   for line in pacmd('list-sinks').strip().splitlines():
-    m = re.match(r'\s*index:\s*([0-9]+)', line)
+    m = re.match(r'\s*(?:\*\s*)?index:\s*([0-9]+)', line)
     if m:
       idx = int(m.group(1))
     m = re.match(r'\s*name:\s*<(\S+)>', line)

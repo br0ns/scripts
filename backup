@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DEV=/dev/sda
+DEV=/dev/sdb
 MNT=/media/backup
 BUP_DIR="$MNT/bup/"
 HOST="$(hostname)"

@@ -26,7 +26,7 @@ def info(msg, fd=sys.stderr):
 def err(msg, fd=sys.stderr):
     print >>fd, 'EE', msg
 
-    # Create archive dir
+# Create archive dir
 if not os.path.exists(ARCHIVE):
     info('Creating archive directory: %s' % ARCHIVE)
     os.mkdir(ARCHIVE)

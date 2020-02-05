@@ -3,14 +3,16 @@ import os
 import sys
 import subprocess
 import re
+import psutil
 
-from collections import defaultdict
+from collections import OrderedDict
 
 DEFAULT_STEP = 5
 VERBOSE = False
+ONLY_ACTIVE = False
 
 def usage():
-    print >>sys.stderr, '''usage: %s ([+-]<0-100>|mute|unmute|toggle|next) [-v|--verbose]
+    print >>sys.stderr, '''usage: %s ([+-]<0-100>|mute|unmute|toggle|next) [--active-window] [-v|--verbose]
 
     N:       Set volume to N%%
     +N:      Increase volume by N%%
@@ -22,165 +24,262 @@ def usage():
              sink ''' % sys.argv[0]
     sys.exit(1)
 
+def die(msg):
+    print >>sys.stderr, msg
+    sys.exit(1)
+
 def optparse(argv):
-  global VERBOSE
-  try:
-    argv.remove('-v')
-    VERBOSE = True
-  except:
-    pass
-  try:
-    argv.remove('--verbose')
-    VERBOSE = True
-  except:
-    pass
-
-  if len(argv) != 2:
-    usage()
-  opt = argv[1]
-  arg = None
-  if opt[0] in '+-':
-      if len(opt) == 1:
-          arg = int(opt + str(DEFAULT_STEP))
-      elif opt[1:].isdigit():
-          arg = int(opt)
-      else:
-          usage()
-      opt = 'adjust'
-  elif opt.isdigit():
-      arg = int(opt)
-      opt = 'set'
-
-  elif opt not in ('toggle', 'mute', 'unmute', 'next'):
-    usage()
-
-  if arg:
-    arg = arg * 0x10000 / 100
-
-  return opt, arg
-
-def runcmd(cmd):
-  out = subprocess.check_output(cmd, shell=True)
-  if VERBOSE:
-    print >>sys.stderr, '$ %s' % cmd
-    print >>sys.stderr, out
-  return out
-
-def pacmd(cmd):
-  return runcmd('pacmd ' + cmd)
-
-def assert_pulseaudio_running():
-  for _ in range(5):
+    global VERBOSE, ONLY_ACTIVE
     try:
-      runcmd('pulseaudio --check')
-      return
+        argv.remove('-v')
+        VERBOSE = True
     except:
-      runcmd('pulseaudio --start')
-  print >>sys.stderr, 'Could not start PulseAudio'
-  sys.exit(1)
+        pass
+    try:
+        argv.remove('--verbose')
+        VERBOSE = True
+    except:
+        pass
 
-def state():
-  current_sink = None
-  sinks = []
-  volume = {}
-  muted = {}
-  for line in pacmd('dump').strip().splitlines():
-    sink = None
-    m = re.match(r'set-sink-volume (\S+) (0x[0-9a-f]+)', line)
-    if m:
-      sink, v = m.groups()
-      v = int(v, 16)
-      volume[sink] = v
-    m = re.match(r'set-sink-mute (\S+) (yes|no)', line)
-    if m:
-      sink, m = m.groups()
-      m = m == 'yes'
-      muted[sink] = m
-    m = re.match(r'set-default-sink (\S+)', line)
-    if m:
-      sink, = m.groups()
-      current_sink = sink
+    try:
+        argv.remove('--active-window')
+        ONLY_ACTIVE = True
+    except:
+        pass
 
-    if sink and sink not in sinks:
-      sinks.append(sink)
+    if len(argv) != 2:
+        usage()
 
-  return current_sink, sinks, volume, muted
+    opt = argv[1]
+    arg = None
+    if opt[0] in '+-':
+        if len(opt) == 1:
+            arg = int(opt + str(DEFAULT_STEP))
+        elif opt[1:].isdigit():
+            arg = int(opt)
+        else:
+            usage()
+        opt = 'adjust'
+    elif opt.isdigit():
+        arg = int(opt)
+        opt = 'set'
 
+    elif opt not in ('toggle', 'mute', 'unmute', 'next'):
+        usage()
+
+    return opt, arg
+
+# Parse args
 opt, arg = optparse(sys.argv)
 
+def runcmd(cmd):
+    out = subprocess.check_output(cmd, shell=True)
+    if VERBOSE:
+        print >>sys.stderr, '$ %s' % cmd
+        print >>sys.stderr, out
+    return out
+
+def pacmd(cmd):
+    return runcmd('pacmd ' + cmd)
+
+def assert_pulseaudio_running():
+    for _ in range(5):
+        try:
+            runcmd('pulseaudio --check')
+            return
+        except:
+            runcmd('pulseaudio --start')
+        print >>sys.stderr, 'Could not start PulseAudio'
+    sys.exit(1)
+
+def parse_error(lines, i, msg):
+    markers = ['   '] * len(lines)
+    markers[i] = '>>>'
+    out = '\n'.join('%s %s' for m, l in zip(markers, lines))
+    die('Parse error: %s\n%s' % (msg, out))
+
+def parse_kvs(lines, i, tabs=1, is_properties=False):
+    kvs = OrderedDict()
+    key = None
+    val = None
+    sub = None
+    sep = '=' if is_properties else ':'
+    def error():
+        die('Parse error: expected "%s<key>%s[<val>]":\n%r' %
+            ('\\t' * tabs, sep, lines[i]))
+
+    while i < len(lines):
+        line = lines[i].lstrip('\t')
+        if not line:
+            i += 1
+            continue
+
+        this_tabs = len(lines[i]) - len(line)
+
+        if this_tabs < tabs:
+            break
+
+        elif this_tabs == tabs:
+            if line[0] == ' ':
+                if not key:
+                    error()
+                kvs[key] += '\n' + line.strip()
+            else:
+                try:
+                    key, val = line.split(sep, 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if is_properties:
+                        while val[-1] != '"':
+                            i += 1
+                            val += lines[i]
+                        val = val.strip('"')
+                    kvs[key] = val
+                except ValueError:
+                    error()
+            i += 1
+
+        else: # this_tabs > tabs
+            is_prop = key == 'properties'
+            i, sub = parse_kvs(lines, i, this_tabs, is_prop)
+            if val:
+                sub['description'] = val
+            kvs[key] = sub
+
+    return i, kvs
+
+def parse(data):
+    out = OrderedDict()
+    lines = data.splitlines()
+    i = 1
+    current = None
+    while i < len(lines):
+        line = lines[i]
+        assert line[4:].startswith('index: ')
+        idx = int(line[11:])
+        if line.startswith('  * '):
+            current = idx
+        i, kvs = parse_kvs(lines, i + 1)
+        out[idx] = kvs
+    return current, out
+
+def yesno(yes):
+    return 'yes' if yes else 'no'
+
+def get_sinks():
+    return parse(pacmd('list-sinks'))
+
+def get_inputs():
+    return parse(pacmd('list-sink-inputs'))[1]
+
+def mute_sink(idx, yes):
+    pacmd('set-sink-mute %d %s' % (idx, yesno(yes)))
+
+def mute_input(idx, yes):
+    pacmd('set-sink-input-mute %d %s' % (idx, yesno(yes)))
+
+def set_sink_volume(idx, vol):
+    pacmd('set-sink-volume %d %d' % (idx, vol))
+
+def set_sink_port(idx, port):
+    pacmd('set-sink-port %d %s' % (idx, port))
+
+def set_default_sink(idx):
+    pacmd('set-default-sink %d' % idx)
+
+def move_inputs(sink_idx):
+    for idx, _ in get_inputs().items():
+        pacmd('move-sink-input %d %d' % (idx, sink_idx))
+
 assert_pulseaudio_running()
-current, sinks, volume, muted = state()
 
-def mute(sink, mute):
-  muted[sink] = mute
-  pacmd('set-sink-mute %s %s' % (current, 'yes' if mute else 'no'))
+# Get current state
+cur_sink, sinks = get_sinks()
+ports = sinks[cur_sink].get('ports')
 
-def card_name(sink):
-  this = False
-  for line in pacmd('list-sinks').strip().splitlines():
-    m = re.match(r'\s*name:\s*<(\S+)>', line)
-    if m:
-      if m.group(1) == sink:
-        this = True
-    m = re.match(r'\s*alsa\.card_name\s*=\s*"(.*)"', line)
-    if m:
-      if this:
-        return m.group(1)
+if ONLY_ACTIVE:
+    winpid = int(subprocess.check_output(
+        ['xdotool', 'getactivewindow', 'getwindowpid']).strip())
+    p = psutil.Process(winpid)
+    pids = [winpid] + [p.pid for p in p.children(recursive=True)]
+    inputs = get_inputs()
+    for k, v in inputs.items():
+        if int(v['properties']['application.process.id']) not in pids:
+            del inputs[k]
+    print pids
 
-def move_inputs(sink):
-  idx = None
-  for line in pacmd('list-sinks').strip().splitlines():
-    m = re.match(r'\s*(?:\*\s*)?index:\s*([0-9]+)', line)
-    if m:
-      idx = int(m.group(1))
-    m = re.match(r'\s*name:\s*<(\S+)>', line)
-    if m:
-      if m.group(1) == sink:
-        break
+volume = {}
+for idx, kvs in sinks.items():
+    curvol = int(re.search(r'\d+', kvs['volume']).group())
+    maxvol = int(re.search(r'\d+', kvs['base volume']).group())
+    volume[idx] = [curvol, maxvol]
 
-  if idx is None:
-    print >>sys.stderr, 'could not find sink index for "%s"' % sink
-    exit(-1)
+# TODO: handle --active-window for all commands
 
-  sink = idx
-
-  for line in pacmd('list-sink-inputs').strip().splitlines():
-    m = re.match(r'\s*index:\s*([0-9]+)', line)
-    if m:
-      idx = int(m.group(1))
-      pacmd('move-sink-input %d %d' % (idx, sink))
-
+# Handle args
 if opt == 'adjust':
-  arg = volume.get(current, 0) + arg
-  arg = min(0x10000, arg)
-  arg = max(0, arg)
-  volume[current] = arg
-  opt = 'set'
+    curvol, maxvol = volume[cur_sink]
+    arg += 100.0 * curvol / maxvol
+    arg = min(100, arg)
+    arg = max(0, arg)
+    opt = 'set'
 
-if   opt == 'set':
-  volume[current] = arg
-  pacmd('set-sink-volume %s %s' % (current, arg))
-  mute(current, False)
+if opt == 'set':
+    maxvol = volume[cur_sink][1]
+    volume[cur_sink][0] = arg * maxvol / 100
+    set_sink_volume(cur_sink, volume[cur_sink][0])
+    mute_sink(cur_sink, False)
 
 elif opt == 'mute':
-  mute(current, True)
+    mute_sink(cur_sink, True)
 
 elif opt == 'unmute':
-  mute(current, False)
+    mute_sink(cur_sink, False)
 
 elif opt == 'toggle':
-  mute(current, not muted.get(current))
+    if ONLY_ACTIVE:
+        for k, v in inputs.items():
+            print k, v['muted']
+            mute_input(k, v['muted'] == 'no')
+    else:
+        mute_sink(cur_sink, sinks[cur_sink]['muted'] == 'no')
 
 elif opt == 'next':
-  current = sinks[(sinks.index(current) + 1) % len(sinks)]
-  move_inputs(current)
-  pacmd('set-default-sink %s' % current)
+    if ports:
+        port_keys = ports.keys()
+        cur_port = sinks[cur_sink]['active port'].strip('<>')
+        i = port_keys.index(cur_port) + 1
+        if i < len(ports):
+            set_sink_port(cur_sink, port_keys[i])
+        else:
+            # Hack: see next if-statement
+            ports = None
 
-print card_name(current) or current
-if muted[current]:
-  print 'muted'
-  os.system('notify "Volume (muted)" --percentage 0 --time 1 &')
+    if not ports:
+        sink_keys = sinks.keys()
+        cur_sink = sink_keys[(sink_keys.index(cur_sink) + 1) % len(sinks)]
+        set_default_sink(cur_sink)
+        ports = sinks[cur_sink].get('ports')
+        if ports:
+            cur_port = ports.keys()[0]
+            set_sink_port(cur_sink, cur_port)
+
+    cur_sink, sinks = get_sinks()
+
+desc = sinks[cur_sink]['properties']['device.description']
+if ports:
+    cur_port = sinks[cur_sink]['active port'].strip('<>')
+    desc += ': ' + ports[cur_port]['description'].split(' (', 1)[0]
+
+cur_sink, sinks = get_sinks()
+if sinks[cur_sink]['muted'] == 'yes':
+    vols = 'muted'
+    vold = 0
 else:
-  v = round(volume[current] * 100.0 / 0x10000)
-  os.system('notify "Volume (%d%%)" --percentage %d --time 1 &' % (v, v))
-  print '%d%%' % v
+    curvol, maxvol = volume[cur_sink]
+    vold = int(100.0 * curvol / maxvol)
+    vols = '%d%%' % (100.0 * curvol / maxvol)
+
+os.system('notify "%s (%s)" --percentage %d --time 1 &' % (desc, vols, vold))
+print desc
+print vols

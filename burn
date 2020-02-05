@@ -1,0 +1,31 @@
+#!/bin/bash
+set -e
+
+__usage() {
+    1>&2 echo "usage: $0 /path/to/dir_or_file [DEVICE]"
+    exit 1
+}
+
+if [ $# -lt 1 ] ; then
+    __usage
+fi
+
+SRC="$(realpath "$1")"
+if [ ! -e "$SRC" ] ; then
+    1>&2 echo "$SRC does not exist"
+    exit 1
+fi
+
+if [ $# -gt 1 ] ; then
+    DEV="$2"
+else
+    DEV=/dev/sr0
+fi
+
+ISO=$(mktemp /tmp/burn-XXXXXX.iso)
+LBL=$(date +%F_%T)
+trap "rm -f \"$ISO\"" EXIT
+
+set -x
+xorriso -as mkisofs -v -J -r -V $LBL -o $ISO "$SRC"
+xorriso -as cdrecord -v dev="$DEV" -dao "$ISO"

@@ -101,7 +101,7 @@ def switch():
 
     # Hack: Resize wallpaper
     subprocess.call('''
-feh --bg-fill ~/.wallpaper.jpg
+feh --bg-fill ~/.wallpaper
     ''', shell=True)
 
 

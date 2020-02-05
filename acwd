@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+import sys
+import os
+import psutil
+import subprocess
+
+if len(sys.argv) > 1:
+    if sys.argv[1] in ('-h', '--help'):
+        print('usage: {} [-h] [SHELL]'.format(sys.argv[0]),
+              file=sys.stderr)
+        sys.exit(1)
+    SHELL=sys.argv[1]
+else:
+    SHELL=os.environ['SHELL']
+
+pid = subprocess.check_output([
+    'xdotool',
+    'getwindowfocus',
+    'getwindowpid',
+])
+pid = int(pid)
+
+for proc in psutil.Process(pid).children(recursive=True):
+    if proc.exe() == SHELL:
+        print(proc.cwd())
+        break
+else:
+    sys.exit(1)

@@ -45,3 +45,11 @@ $ ./INSTALL <dst>
 ## `xrandr-cycle`
 
 (write this)
+
+## `acwd`
+
+Get current working directory of shell in active window (if any).
+
+## `burn`
+
+Burn files to DVD/CD.

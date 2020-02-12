@@ -2,9 +2,14 @@
 set -e
 
 __usage() {
-    1>&2 echo "usage: $0 /path/to/dir_or_file [DEVICE]"
+    1>&2 echo "usage: $0 [-c|--encrypt] /path/to/dir_or_file [DEVICE]"
     exit 1
 }
+
+if [ "$1" = "-c" -o "$1" = "--encrypt" ] ; then
+    ENCRYPT=yes
+    shift
+fi
 
 if [ $# -lt 1 ] ; then
     __usage
@@ -22,10 +27,19 @@ else
     DEV=/dev/sr0
 fi
 
-ISO=$(mktemp /tmp/burn-XXXXXX.iso)
-LBL=$(date +%F_%T)
-trap "rm -f \"$ISO\"" EXIT
+TMP=$(mktemp /tmp/burn-XXXXXX)
+ISO="$TMP".iso
+TAR="$TMP".tar
+GPG="$TAR".gpg
+LBL="$(date +%F_%T)"
+trap "shred -u \"$ISO\" \"$TAR\" \"$GPG\"" EXIT
 
 set -x
-xorriso -as mkisofs -v -J -r -V $LBL -o $ISO "$SRC"
+if [ -n "$ENCRYPT" ] ; then
+    tar -cf "$TAR" "$SRC"
+    gpg -c "$TAR"
+    SRC="$GPG"
+fi
+
+xorriso -as mkisofs -v -J -r -V "$LBL" -o "$ISO" "$SRC"
 xorriso -as cdrecord -v dev="$DEV" -dao "$ISO"

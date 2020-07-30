@@ -1,0 +1,17 @@
+#!/bin/sh
+
+if [ $# -eq 0 ] ; then
+    # 2>&1 echo "usage: $0 PROFILE"
+    # exit 1
+    PROFILE=$(
+        for pdir in $HOME/.config/google-chrome-* ; do
+            echo "${pdir#*google-chrome-}"
+        done | fzf
+    )
+else
+    PROFILE="$1"
+fi
+
+set -e
+set -x
+google-chrome --user-data-dir=$HOME/.config/google-chrome-$PROFILE --new-window &

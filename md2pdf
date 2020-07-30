@@ -1,11 +1,24 @@
-#!/bin/sh
+#!/bin/bash
 
 if [ $# -lt 1 ] ; then
     echo "usage: $0 <doc.md> [<doc.md> [...]]"
     exit 1
 fi
 
-for doc in "$@" ; do
-    echo "$doc"
-    pandoc "$doc" -o "${doc%.md}.pdf"
+docs=()
+args=()
+
+for x in "$@" ; do
+    case "$x" in
+        -*)
+            args+=("$x")
+            ;;
+        *)
+            docs+=("$x")
+    esac
+done
+
+set -e
+for doc in "${docs[@]}" ; do
+    pandoc "${args[@]}" "$doc" -o "${doc%.md}.pdf"
 done

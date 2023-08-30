@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+import sys
+import os
+import shutil
+import psutil
+import subprocess
+import struct
+import socket
+import time
+import shlex
+from binascii import hexlify
+
+SHELL = os.environ['SHELL']
+XTERM = shutil.which('xterm')
+try:
+    SSH = shutil.which('ssh')
+except:
+    SSH = None
+
+class NotFound(Exception): pass
+
+class CopySSH(object):
+    def __init__(self, proc):
+        cmdline = proc.cmdline()
+        self.env = proc.environ()
+
+        # Drop remote command from ssh command
+        i = 1
+        found_host = False
+        while i < len(cmdline):
+            arg = cmdline[i]
+            if arg[0] == '-':
+                i += 1
+            elif found_host:
+                break
+            else:
+                found_host = True
+            i += 1
+
+        self.args = cmdline[1:i]
+
+        self.p = subprocess.Popen(
+            [SSH] + self.args + ['sh'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            text=False,
+            env=self.env,
+            bufsize=0,
+        )
+
+        self._eof = hexlify(os.urandom(10)) + b'\n'
+        self.shell = self.run('echo $SHELL').strip().decode()
+        self.uid = int(self.run('id -u').strip())
+
+    def run(self, cmd):
+        self.p.stdin.write(cmd.encode() + b' ; echo ' + self._eof)
+        ret = b''
+        while not ret.endswith(self._eof):
+            ret += self.p.stdout.read(1)
+        return ret[:-len(self._eof)]
+
+    def readlink(self, path):
+        return self.run(f'readlink {path}').strip().decode()
+
+    def getexe(self, pid):
+        return self.readlink(f'/proc/{pid}/exe')
+
+    def getcwd(self, pid):
+        return self.readlink(f'/proc/{pid}/cwd')
+
+    def getenv(self, pid):
+        env = self.run(f'cat /proc/{pid}/environ')
+        ret = {}
+        for kv in env.split(b'\0'):
+            if not kv:
+                continue
+            try:
+                k, v = kv.decode().split('=')
+                ret[k] = v
+            except:
+                ret[kv] = None
+        return ret
+
+def main():
+    # Get ID of focused window
+    wid = int(subprocess.check_output([
+        'xdotool',
+        'getwindowfocus',
+    ]))
+
+    try:
+        # Get PID and client of window
+        wm_pid, wm_client = [
+            x.split(b' = ')[1].strip().decode() for x in subprocess.check_output([
+                'xprop',
+                '-id',
+                str(wid),
+                '_NET_WM_PID',
+                'WM_CLIENT_MACHINE',
+            ]).splitlines()
+        ]
+        wm_pid = int(wm_pid)
+        wm_client = wm_client.strip('"')
+
+        # XXX: This method is brittle
+        # Ref: https://hackage.haskell.org/package/xmonad-contrib-0.16/docs/XMonad-Util-RemoteWindows.html
+        localhost = socket.gethostname()
+        if localhost != wm_client:
+            remote_pid(wm_pid, wm_client)
+        else:
+            local_pid(wm_pid)
+    except:
+        # Something went wrong; default to at least open xterm
+        xterm()
+
+
+def xterm(argv=None, env=None, cwd=None):
+    argv = argv or []
+    if cwd:
+        cmd = f'cd "{cwd}" ; exec $SHELL'
+        argv += [cmd]
+
+    if argv:
+        argv = [XTERM, '-e'] + argv
+    else:
+        argv = [XTERM]
+
+    # Daemonize
+
+    ## First fork
+    try:
+        if os.fork():
+            # Parent
+            os._exit(0)
+    except OSError:
+        exit(1)
+
+    ## De-couple
+    os.setsid()
+    os.umask(0)
+
+    ## Second fork
+    try:
+        if os.fork():
+            # Parent
+            os._exit(0)
+    except OSError:
+        exit(1)
+
+    ## Redirect std{in,out,err} to /dev/null
+    fd = os.open(os.devnull, os.O_RDWR)
+    os.dup2(fd, 0)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    if fd > 2:
+        os.close(fd)
+
+    # Execute XTERM in daemon
+    if env:
+        os.execve(argv[0], argv, env)
+    else:
+        os.execv(argv[0], argv)
+
+    # Never reached (hopyfully)
+    exit(1)
+
+def xterm_local(proc):
+    xterm(env=proc.environ(), cwd=proc.cwd())
+
+def xterm_remote(ssh, pid):
+    argv = [SSH, '-t'] + ssh.args
+    xterm(argv=argv, env=ssh.env, cwd=ssh.getcwd(pid))
+
+def remote_pid(pid, host):
+    for proc in psutil.Process(1).children(recursive=True):
+        try:
+            if proc.exe() != SSH:
+                continue
+        except psutil.AccessDenied:
+            continue
+        # HACK: get real remote address somehow, and use psutil.net_connections
+        # HACK: if that is not possible, we'll maybe have to parse ~/.ssh/config :/
+        # REF: https://unix.stackexchange.com/questions/5478/what-process-created-this-x11-window
+        if any(host in arg for arg in proc.cmdline()):
+            break
+    else:
+        raise NotFound()
+
+    ssh = CopySSH(proc)
+    xterm_remote(ssh, pid)
+
+def local_pid(pid):
+    try:
+        remote_shell(pid)
+    except NotFound:
+        local_shell(pid)
+
+def remote_shell(local_pid):
+    # Find SSH connection below this local PID
+    for proc in psutil.Process(local_pid).children(recursive=True):
+        if proc.exe() == SSH:
+            break
+    else:
+        raise NotFound()
+
+    # Find connection details for SSH connection
+    for conn in psutil.net_connections():
+        if conn.pid == proc.pid:
+            break
+    else:
+        raise NotFound()
+    laddr = conn.laddr
+    raddr = conn.raddr
+
+    # Establish new SSH connection
+    ssh = CopySSH(proc)
+
+    # Get remote shell and UID
+    remote_shell = ssh.shell
+    remote_uid = ssh.uid
+    remote_pid = None # Set below
+
+    # Get list of PIDs running below SSHDs with correct UID
+    pids = map(int, ssh.run(f'pgrep -P $(pgrep -d, -u {remote_uid} sshd)').splitlines())
+
+    # Search for a PID with correct SSH_CONNECTION
+    needle = f'{laddr.ip} {laddr.port} {raddr.ip} {raddr.port}'
+    for pid in pids:
+        env = ssh.getenv(pid)
+        if env.get('SSH_CONNECTION') == needle:
+            remote_pid = pid
+            break
+    else:
+        # Fall back: find SSHD started closest to when the connection was initiated
+        local_started = proc.create_time()
+        local_elapsed = time.time() - local_started
+        remote_sshds = ssh.run('ps -C sshd -o pid,etimes,uid').splitlines()[1:]
+        delta = float('inf')
+        for line in remote_sshds:
+            pid, elapsed, uid = [int(x) for x in line.split()]
+            if uid != remote_uid:
+                continue
+            d = abs(elapsed - local_elapsed)
+            if d < delta:
+                remote_pid = pid
+                delta = d
+
+    # Did we find the remote PID?
+    if not remote_pid:
+        raise NotFound
+
+    # Recrusively search children (BFS) for a shell
+    pids = [remote_pid]
+    while pids:
+        pid = pids.pop(0)
+        exe = ssh.getexe(pid)
+        if exe == remote_shell:
+            break
+        pids += [int(cpid) for cpid in ssh.run(f'pgrep -P {pid}').splitlines()]
+    else:
+        raise NotFound
+
+    xterm_remote(ssh, pid)
+
+def local_shell(pid):
+    for proc in psutil.Process(pid).children(recursive=True):
+        if proc.exe() == SHELL:
+            xterm_local(proc)
+    raise NotFound
+
+if __name__ == '__main__':
+    main()

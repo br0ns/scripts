@@ -8,6 +8,8 @@ import struct
 import socket
 import time
 import shlex
+import traceback
+import signal
 from binascii import hexlify
 
 SHELL = os.environ['SHELL']
@@ -24,20 +26,43 @@ class CopySSH(object):
         cmdline = proc.cmdline()
         self.env = proc.environ()
 
-        # Drop remote command from ssh command
+        no_arg = '46AaCfGgKkMNnqsTtVvXxYy'
+        wanted = 'ioJpSF'
+
+        # Build fresh SSH command from process command line
+        args = []
+        host = None
         i = 1
-        found_host = False
         while i < len(cmdline):
             arg = cmdline[i]
             if arg[0] == '-':
-                i += 1
-            elif found_host:
+                flag = arg[1]
+
+                if flag in no_arg:
+                    flags = {x: None for x in arg[1:]}
+                else:
+                    if len(arg) > 2:
+                        opt = arg[2:]
+                    else:
+                        i += 1
+                        opt = cmdline[i]
+                    flags = {flag: opt}
+
+                for k, v in flags.items():
+                    if k not in wanted:
+                        continue
+                    args.append('-' + k)
+                    if v is not None:
+                        args.append(v)
+
+            elif host:
                 break
             else:
-                found_host = True
+                host = arg
             i += 1
 
-        self.args = cmdline[1:i]
+        assert host is not None
+        self.args = args + [host]
 
         self.p = subprocess.Popen(
             [SSH] + self.args + ['sh'],
@@ -84,37 +109,44 @@ class CopySSH(object):
         return ret
 
 def main():
+    # If anything bad happens, then fall back to at least spawn a terminal
+    def excepthook(*args):
+        print('Cought exception at top-level:', file=sys.stderr)
+        traceback.print_exception(*args)
+        print('Spawning fall-back Xterm', file=sys.stderr)
+        xterm()
+        os._exit(1)
+    sys.excepthook = excepthook
+
+    # Avoid badly behaved processing from hanging around
+    signal.alarm(5)
+
     # Get ID of focused window
     wid = int(subprocess.check_output([
         'xdotool',
         'getwindowfocus',
     ]))
 
-    try:
-        # Get PID and client of window
-        wm_pid, wm_client = [
-            x.split(b' = ')[1].strip().decode() for x in subprocess.check_output([
-                'xprop',
-                '-id',
-                str(wid),
-                '_NET_WM_PID',
-                'WM_CLIENT_MACHINE',
-            ]).splitlines()
-        ]
-        wm_pid = int(wm_pid)
-        wm_client = wm_client.strip('"')
+    # Get PID and client of window
+    wm_pid, wm_client = [
+        x.split(b' = ')[1].strip().decode() for x in subprocess.check_output([
+            'xprop',
+            '-id',
+            str(wid),
+            '_NET_WM_PID',
+            'WM_CLIENT_MACHINE',
+        ]).splitlines()
+    ]
+    wm_pid = int(wm_pid)
+    wm_client = wm_client.strip('"')
 
-        # XXX: This method is brittle
-        # Ref: https://hackage.haskell.org/package/xmonad-contrib-0.16/docs/XMonad-Util-RemoteWindows.html
-        localhost = socket.gethostname()
-        if localhost != wm_client:
-            remote_pid(wm_pid, wm_client)
-        else:
-            local_pid(wm_pid)
-    except:
-        # Something went wrong; default to at least open xterm
-        xterm()
-
+    # XXX: This method is brittle
+    # Ref: https://hackage.haskell.org/package/xmonad-contrib-0.16/docs/XMonad-Util-RemoteWindows.html
+    localhost = socket.gethostname()
+    if localhost != wm_client:
+        remote_pid(wm_pid, wm_client)
+    else:
+        local_pid(wm_pid)
 
 def xterm(argv=None, env=None, cwd=None):
     argv = argv or []
@@ -164,7 +196,7 @@ def xterm(argv=None, env=None, cwd=None):
         os.execv(argv[0], argv)
 
     # Never reached (hopyfully)
-    exit(1)
+    os._exit(1)
 
 def xterm_local(proc):
     xterm(env=proc.environ(), cwd=proc.cwd())
@@ -249,7 +281,7 @@ def remote_shell(local_pid):
 
     # Did we find the remote PID?
     if not remote_pid:
-        raise NotFound
+        raise NotFound()
 
     # Recrusively search children (BFS) for a shell
     pids = [remote_pid]
@@ -260,7 +292,7 @@ def remote_shell(local_pid):
             break
         pids += [int(cpid) for cpid in ssh.run(f'pgrep -P {pid}').splitlines()]
     else:
-        raise NotFound
+        raise NotFound()
 
     xterm_remote(ssh, pid)
 
@@ -268,7 +300,8 @@ def local_shell(pid):
     for proc in psutil.Process(pid).children(recursive=True):
         if proc.exe() == SHELL:
             xterm_local(proc)
-    raise NotFound
+    raise NotFound()
 
 if __name__ == '__main__':
+    # Do the thing
     main()

@@ -23,8 +23,8 @@ class NotFound(Exception): pass
 
 class CopySSH(object):
     def __init__(self, proc):
+        self.copy_of = proc
         cmdline = proc.cmdline()
-        self.env = proc.environ()
 
         no_arg = '46AaCfGgKkMNnqsTtVvXxYy'
         wanted = 'ioJpSF'
@@ -71,7 +71,7 @@ class CopySSH(object):
             stderr=subprocess.PIPE,
             shell=False,
             text=False,
-            env=self.env,
+            env=proc.environ(),
             bufsize=0,
         )
 
@@ -148,19 +148,7 @@ def main():
     else:
         local_pid(wm_pid)
 
-def xterm(argv=None, env=None, cwd=None):
-    argv = argv or []
-    if cwd:
-        cmd = f'cd "{cwd}" ; exec $SHELL'
-        argv += [cmd]
-
-    if argv:
-        argv = [XTERM, '-e'] + argv
-    else:
-        argv = [XTERM]
-
-    # Daemonize
-
+def daemon(argv, env=None):
     ## First fork
     try:
         if os.fork():
@@ -198,12 +186,24 @@ def xterm(argv=None, env=None, cwd=None):
     # Never reached (hopyfully)
     os._exit(1)
 
-def xterm_local(proc):
-    xterm(env=proc.environ(), cwd=proc.cwd())
+def xterm():
+    daemon([XTERM])
 
-def xterm_remote(ssh, pid):
-    argv = [SSH, '-t'] + ssh.args
-    xterm(argv=argv, env=ssh.env, cwd=ssh.getcwd(pid))
+def xterm_local(proc):
+    argv = [XTERM, '-e', f'cd "{proc.cwd()}" ; exec $SHELL']
+    env = proc.environ()
+    daemon(argv, env)
+
+def xterm_remote(ssh, remote_pid):
+    # Spawn a remote shell in remote CWD, but fall back to a local shell in
+    # local CWD on exit
+    proc = ssh.copy_of
+    env = proc.environ()
+    remote_argv = [SSH, '-t'] + ssh.args + \
+        [f'cd "{ssh.getcwd(remote_pid)}" ; exec {ssh.shell}']
+    argv = [XTERM, '-e', shlex.join(remote_argv) + \
+            f' ; cd {proc.cwd()} ; exec $SHELL']
+    daemon(argv)
 
 def remote_pid(pid, host):
     for proc in psutil.Process(1).children(recursive=True):

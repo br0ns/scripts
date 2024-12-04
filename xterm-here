@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import stat
 import shutil
 import psutil
 import subprocess
@@ -10,14 +11,27 @@ import time
 import shlex
 import traceback
 import signal
+import re
+import logging
 from binascii import hexlify
 
-SHELL = os.environ['SHELL']
-XTERM = shutil.which('xterm')
-try:
-    SSH = shutil.which('ssh')
-except:
-    SSH = None
+# This script will pop a new terminal at the focused window's CWD, even if it is
+# remote.
+#
+# TODO: Currently only Xterm is supported (due to `-e` argument in
+#       `term_local`/`term_remote`).
+
+# Defaults in case the process calling this script does not have these
+# environment variables set
+DEFAULT_SHELL='fish'
+DEFAULT_TERM='xterm'
+
+logger = logging.getLogger(__name__)
+debug = logger.debug
+info = logger.info
+warn = logger.warning
+error = logger.error
+log = info
 
 class NotFound(Exception): pass
 
@@ -25,6 +39,14 @@ class CopySSH(object):
     def __init__(self, proc):
         self.copy_of = proc
         cmdline = proc.cmdline()
+
+        info(f'Copying SSH connection:')
+        info(f'  PID: {proc.pid}')
+        info(f'  argv: {proc.cmdline()}')
+
+        # We have a running SSH session in `proc` and now we need to create a
+        # new one with a shell on the remote.  We parse the command line in
+        # order to build an argv for our new process.
 
         no_arg = '46AaCfGgKkMNnqsTtVvXxYy'
         wanted = 'ioJpSF'
@@ -62,10 +84,23 @@ class CopySSH(object):
             i += 1
 
         assert host is not None
+
+        # May have that host is a control master socket
+        try:
+            st = os.stat(host)
+            if stat.S_ISSOCK(st.st_mode):
+                args += ['-S', host]
+                host = '-'
+        except:
+            pass
+
         self.args = args + [host]
 
+        argv = [SSH] + self.args + ['sh']
+        info(f'New SSH connection:')
+        info(f'  argv: {argv}')
         self.p = subprocess.Popen(
-            [SSH] + self.args + ['sh'],
+            argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -76,14 +111,19 @@ class CopySSH(object):
         )
 
         self._eof = hexlify(os.urandom(10)) + b'\n'
-        self.shell = self.run('echo $SHELL').strip().decode()
+        self.shell = self.run('echo "$(realpath -m "$SHELL")"').strip().decode()
         self.uid = int(self.run('id -u').strip())
+        info(f'  remote shell: {self.shell}')
+        info(f'  remote uid: {self.uid}')
 
     def run(self, cmd):
         self.p.stdin.write(cmd.encode() + b' ; echo ' + self._eof)
         ret = b''
         while not ret.endswith(self._eof):
-            ret += self.p.stdout.read(1)
+            c = self.p.stdout.read(1)
+            if not c:
+                raise EOFError
+            ret += c
         return ret[:-len(self._eof)]
 
     def readlink(self, path):
@@ -109,14 +149,32 @@ class CopySSH(object):
         return ret
 
 def main():
-    # If anything bad happens, then fall back to at least spawn a terminal
+    # If anything bad happens, then fall back to at least spawn a terminal.  If
+    # even that fails, then at least at least flush the logs.
     def excepthook(*args):
-        print('Cought exception at top-level:', file=sys.stderr)
-        traceback.print_exception(*args)
-        print('Spawning fall-back Xterm', file=sys.stderr)
-        xterm()
+        warn('Cought exception at top-level:\n' +
+             '\n'.join(traceback.format_exception(*args))
+        )
+        info('Spawning fall-back terminal')
+        term_fallback()
+        for h in logger.handlers:
+            h.flush()
         os._exit(1)
     sys.excepthook = excepthook
+
+    # Set globals
+    global SHELL, TERM, SSH
+    SHELL = shutil.which(os.environ.get('SHELL', DEFAULT_SHELL))
+    TERM = shutil.which(os.environ.get('TERM', DEFAULT_TERM))
+    # We can live without SSH, but do we really want to?
+    try:
+        SSH = shutil.which('ssh')
+    except:
+        SSH = None
+
+    debug(f'{SHELL=}')
+    debug(f'{TERM=}')
+    debug(f'{SSH=}')
 
     # Avoid badly behaved processing from hanging around
     signal.alarm(5)
@@ -143,12 +201,23 @@ def main():
     # XXX: This method is brittle
     # Ref: https://hackage.haskell.org/package/xmonad-contrib-0.16/docs/XMonad-Util-RemoteWindows.html
     localhost = socket.gethostname()
+
+    info(f'Window PID: {wm_pid}')
+    info(f'Window client: {wm_client}')
+    info(f'Local host: {localhost}')
+
     if localhost != wm_client:
+        info('PID is remote')
         remote_pid(wm_pid, wm_client)
     else:
+        info('PID is local')
         local_pid(wm_pid)
 
 def daemon(argv, env=None):
+    debug(f'{argv=}\n' +
+          'env=\n' +
+          ('\n'.join(f'  {k}={v}' for k, v in env.items()) if env else '  (inherited)')
+    )
     ## First fork
     try:
         if os.fork():
@@ -159,7 +228,6 @@ def daemon(argv, env=None):
 
     ## De-couple
     os.setsid()
-    os.umask(0)
 
     ## Second fork
     try:
@@ -177,7 +245,7 @@ def daemon(argv, env=None):
     if fd > 2:
         os.close(fd)
 
-    # Execute XTERM in daemon
+    # Execute TERM in daemon
     if env:
         os.execve(argv[0], argv, env)
     else:
@@ -186,23 +254,32 @@ def daemon(argv, env=None):
     # Never reached (hopyfully)
     os._exit(1)
 
-def xterm():
-    daemon([XTERM])
+def term_fallback():
+    daemon([TERM])
 
-def xterm_local(proc):
-    argv = [XTERM, '-e', f'cd "{proc.cwd()}" ; exec $SHELL']
+def term_local(proc):
+    cwd = proc.cwd()
+    info(f'Local process with PID={proc.pid} has CWD={cwd}')
+    argv = [TERM, '-e', f'cd "{proc.cwd()}" ; exec $SHELL']
     env = proc.environ()
     daemon(argv, env)
 
-def xterm_remote(ssh, remote_pid):
+def term_remote(ssh, remote_pid):
     # Spawn a remote shell in remote CWD, but fall back to a local shell in
     # local CWD on exit
     proc = ssh.copy_of
     env = proc.environ()
-    remote_argv = [SSH, '-t'] + ssh.args + \
-        [f'cd "{ssh.getcwd(remote_pid)}" ; exec {ssh.shell}']
-    argv = [XTERM, '-e', shlex.join(remote_argv) + \
+    if remote_pid:
+        cwd = ssh.getcwd(remote_pid)
+        info(f'Remote process with PID={remote_pid} has CWD={cwd}')
+        cmd = f'cd "{cwd}" ; exec {ssh.shell}'
+    else:
+        cmd = f'exec {ssh.shell}'
+    remote_argv = [SSH, '-t'] + ssh.args + [cmd]
+    argv = [TERM, '-e', shlex.join(remote_argv) + \
             f' ; cd {proc.cwd()} ; exec $SHELL']
+    # TODO: maybe also bring (some of) the environment? All of it is no good
+    # because of sessions specific vars: SSH/XDG/XORG/...
     daemon(argv)
 
 def remote_pid(pid, host):
@@ -218,10 +295,12 @@ def remote_pid(pid, host):
         if any(host in arg for arg in proc.cmdline()):
             break
     else:
+        info(f'Could not find a running SSH connection to {host}')
         raise NotFound()
 
+    info(f'Found SSH connection to {host}')
     ssh = CopySSH(proc)
-    xterm_remote(ssh, pid)
+    term_remote(ssh, pid)
 
 def local_pid(pid):
     try:
@@ -229,79 +308,205 @@ def local_pid(pid):
     except NotFound:
         local_shell(pid)
 
-def remote_shell(local_pid):
-    # Find SSH connection below this local PID
-    for proc in psutil.Process(local_pid).children(recursive=True):
-        if proc.exe() == SSH:
-            break
-    else:
-        raise NotFound()
+def find_remote_shell(ssh):
+    info('Looking for remote shell')
+    proc = ssh.copy_of
+    # Now we need to find the relevant SSH session on the remote server.  To do
+    # that we find the connection from here to there, so we can compare on the
+    # remote end.
 
-    # Find connection details for SSH connection
-    for conn in psutil.net_connections():
+    # Look for an IPv{4,6} connection from this process
+    for conn in psutil.net_connections('inet'):
         if conn.pid == proc.pid:
             break
     else:
-        raise NotFound()
+        # Maybe we're using a control master, look for socket connections.
+        # Unfortunately `psutil` will not tell us the remote end of a UNIX
+        # socket, so fall back to `ss`
+        conns = []
+        for line in subprocess.check_output(['ss', '-nxpHO']).splitlines():
+            fields = line.split() + [b''] * 9
+            laddr, lport, raddr, rport, procs = fields[4:9]
+            pids = re.findall(b'pid=(\\d+)', procs)
+            # Sanitize
+            lport = int(lport)
+            rport = int(rport)
+            pids = [int(p) for p in pids]
+            if laddr == b'*': laddr = None
+            if raddr == b'*': raddr = None
+            conns.append((laddr, lport, raddr, rport, pids))
+        # Find connections from our PID and record the remote port(s)
+        rports = set()
+        for laddr, lport, raddr, rport, pids in conns:
+            if proc.pid in pids:
+                rports.add(rport)
+        # Collect PID(s) at the other end(s)
+        rpids = set()
+        for laddr, lport, raddr, rport, pids in conns:
+            if lport in rports:
+                rpids.update(pids)
+        # Look for SSH with an inet connection among those PIDs
+        for pid in rpids:
+            p = psutil.Process(pid)
+            try:
+                if p.exe() != SSH:
+                    continue
+            except psutil.AccessDenied:
+                continue
+            # Found SSH, but does it have a connection?
+            for conn in psutil.net_connections('inet'):
+                if conn.pid == p.pid:
+                    break
+            else: # if not, try the next one
+                continue
+            break # we're done here
+        else:
+            log('Found no SSH connections')
+            raise NotFound()
+
     laddr = conn.laddr
     raddr = conn.raddr
-
-    # Establish new SSH connection
-    ssh = CopySSH(proc)
+    info(f'Found SSH connection to {laddr}')
 
     # Get remote shell and UID
     remote_shell = ssh.shell
     remote_uid = ssh.uid
-    remote_pid = None # Set below
 
     # Get list of PIDs running below SSHDs with correct UID
-    pids = map(int, ssh.run(f'pgrep -P $(pgrep -d, -u {remote_uid} sshd)').splitlines())
+    pids = set(int(p) for p in ssh.run(f'pgrep -P $(pgrep -d, -u {remote_uid} sshd)').splitlines())
 
-    # Search for a PID with correct SSH_CONNECTION
+    # Did we find any remote PIDs?
+    if not pids:
+        info(f'Could not find remote SSHD')
+        raise NotFound()
+
+    # Search for a PID(s) with correct SSH_CONNECTION
     needle = f'{laddr.ip} {laddr.port} {raddr.ip} {raddr.port}'
+    good_pids = set()
     for pid in pids:
         env = ssh.getenv(pid)
         if env.get('SSH_CONNECTION') == needle:
-            remote_pid = pid
-            break
+            good_pids.add(pid)
+
+    if good_pids:
+        pids = good_pids
+        info(f'Found {len(pids)} remote processes with correct SSH_CONNECTION:')
     else:
-        # Fall back: find SSHD started closest to when the connection was initiated
-        local_started = proc.create_time()
-        local_elapsed = time.time() - local_started
-        remote_sshds = ssh.run('ps -C sshd -o pid,etimes,uid').splitlines()[1:]
-        delta = float('inf')
-        for line in remote_sshds:
-            pid, elapsed, uid = [int(x) for x in line.split()]
-            if uid != remote_uid:
-                continue
-            d = abs(elapsed - local_elapsed)
-            if d < delta:
-                remote_pid = pid
-                delta = d
+        # If we didn't find any (because SSH_CONNECTION was not set for
+        # reasons), we fall back to all processes with correct UID under SSHD
+        info(f'Found {len(pids)} remote processes:')
+    info(f'  {", ".join(str(pid) for pid in pids)}')
 
-    # Did we find the remote PID?
-    if not remote_pid:
-        raise NotFound()
-
-    # Recrusively search children (BFS) for a shell
-    pids = [remote_pid]
+    # Recrusively search children (BFS) for a shells
+    shells = set()
+    pids = list(pids)
     while pids:
         pid = pids.pop(0)
         exe = ssh.getexe(pid)
         if exe == remote_shell:
-            break
+            shells.add(pid)
         pids += [int(cpid) for cpid in ssh.run(f'pgrep -P {pid}').splitlines()]
-    else:
+
+    # Couldn't find a shell
+    if not shells:
+        info(f'Could not find remote shell')
         raise NotFound()
 
-    xterm_remote(ssh, pid)
+    info(f'Found {len(shells)} remote shells:')
+    info(f'  {", ".join(str(pid) for pid in shells)}')
+
+    # If we found just one remote shell we return its PID
+    if len(shells) == 1:
+        return shells.pop()
+
+    # Otherwise we pick the one that was spawned closes to our local process.
+    delta = float('inf')
+    local_started = proc.create_time()
+    local_elapsed = time.time() - local_started
+    best_pid = None
+    for line in ssh.run(f'ps -p {",".join(str(p) for p in shells)} -o pid,etimes').splitlines()[1:]:
+        pid, elapsed = [int(x) for x in line.split()]
+        d = abs(elapsed - local_elapsed)
+        if d < delta:
+            best_pid = pid
+            delta = d
+
+    info(f'Using PID={best_pid} with time delta {delta}s')
+
+    return best_pid
+
+def remote_shell(local_pid):
+    info('Looking for SSH connections under local process')
+    # Find SSH connection below this local PID
+    for proc in psutil.Process(local_pid).children(recursive=True):
+        try:
+            if proc.exe() == SSH:
+                break
+        except psutil.ZombieProcess:
+            debug(f'Ignoring zombie: {proc.pid}')
+    else:
+        info('No SSH connection found')
+        raise NotFound()
+    info(f'Found SSH (PID={proc.pid}) under local process')
+
+    # Establish new SSH connection
+    ssh = CopySSH(proc)
+
+    # Try and find the corresponding remote shell, ortherwise just pop a shell
+    # on the remote host in $HOME
+    try:
+        pid = find_remote_shell(ssh)
+        info(f'Found remote shell (PID={pid})')
+    except NotFound:
+        info(f'Could not find remote shell; defaulting to $HOME')
+        pid = None
+
+    term_remote(ssh, pid)
 
 def local_shell(pid):
+    info('Looking for local shell')
     for proc in psutil.Process(pid).children(recursive=True):
-        if proc.exe() == SHELL:
-            xterm_local(proc)
+        try:
+            if proc.exe() == SHELL:
+                term_local(proc)
+        except psutil.ZombieProcess:
+            debug(f'Ignoring zombie: {proc.pid}')
+    info('Local shell not found')
     raise NotFound()
 
 if __name__ == '__main__':
+    class ColorFormatter(logging.Formatter):
+        attrs = {
+            logging.DEBUG:    '\x1b[33m',
+            logging.INFO:     '\x1b[34m',
+            logging.WARNING:  '\x1b[33;1m',
+            logging.ERROR:    '\x1b[31;1m',
+            logging.CRITICAL: '\x1b[31;1m',
+        }
+        def formatMessage(self, record):
+            sgr = self.attrs.get(record.levelno, '')
+            if sgr:
+                record.levelname = sgr + record.levelname + '\x1b[m'
+            msg = super().formatMessage(record)
+            try:
+                i = msg.index(' ')
+                prefix = msg[:i] + ' '
+            except ValueError:
+                prefix = ''
+            return msg.replace('\n', '\n' + prefix)
+
+    is_debug = 'DEBUG' in sys.argv
+    logging.root.setLevel(logging.DEBUG if is_debug else logging.INFO)
+    fmt = '%(levelname)s:%(funcName)s: %(message)s'
+    h = logging.StreamHandler()
+    h.setFormatter(ColorFormatter(fmt))
+    logging.root.addHandler(h)
+
+    if is_debug:
+        logging.root.setLevel(logging.DEBUG)
+        h = logging.FileHandler('/home/user/xterm-here.log')
+        h.setFormatter(ColorFormatter(fmt))
+        logging.root.addHandler(h)
+
     # Do the thing
     main()

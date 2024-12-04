@@ -1,17 +1,35 @@
 #!/bin/sh
 
-if [ $# -eq 0 ] ; then
-    # 2>&1 echo "usage: $0 PROFILE"
-    # exit 1
-    PROFILE=$(
+SCRATCH="<scratch>"
+
+PROFILE=$(
+    {
+        echo "$SCRATCH"
         for pdir in $HOME/.config/google-chrome-* ; do
             echo "${pdir#*google-chrome-}"
-        done | fzf
-    )
+        done
+    } | fzf
+       )
+if [ $? -ne 0 ] ; then
+    exit 1
+fi
+
+if [ "$PROFILE" = "$SCRATCH" ] ; then
+    DATADIR=$(mktemp --directory)
+    # Clean up on exit
+    trap "rm -vr \"$DATADIR\"" EXIT
 else
-    PROFILE="$1"
+    DATADIR="$HOME"/.config/google-chrome-"$PROFILE"
 fi
 
 set -e
 set -x
-google-chrome --user-data-dir=$HOME/.config/google-chrome-$PROFILE --new-window &
+google-chrome --user-data-dir="$DATADIR" --new-window "$@" &
+
+if [ "$PROFILE" = "$SCRATCH" ] ; then
+    # Skip dialog on first run
+    sleep 0.5
+    xdotool key --clearmodifiers -- Tab space Tab space Tab Tab Return
+    # Wait for process so clean up will run
+    wait
+fi
